@@ -1,0 +1,417 @@
+From 18f08a414a4b43025ad239a7ee8df0d6688c8294 Mon Sep 17 00:00:00 2001
+From: Iuri Chaer <ichaer@splunk.com>
+Date: Sat, 12 Oct 2024 03:14:09 +0100
+Subject: [PATCH 1/1] [clang-format] Introduce "ReflowComments: IndentOnly" to
+ re-indent comments without breaking internal structure (think Doxygen).
+ (#96804)
+
+* Convert `ReflowComments` from boolean into a new `enum` which can take
+on the value `RCS_Never`, `RCS_IndentOnly`, or `RCS_Always`. The first
+one is equivalent to the old `false`, the third one is `true`, and the
+middle one means that multiline comments should only have their
+indentation corrected, which is what Doxygen users will want.
+* Preserve backward compatibility while parsing `ReflowComments`.
+---
+ clang/docs/ClangFormatStyleOptions.rst        | 50 +++++++++++++-----
+ clang/docs/ReleaseNotes.rst                   |  2 +
+ clang/include/clang/Format/Format.h           | 51 +++++++++++++------
+ clang/lib/Format/BreakableToken.cpp           | 10 ++--
+ clang/lib/Format/BreakableToken.h             |  2 +
+ clang/lib/Format/ContinuationIndenter.cpp     |  4 +-
+ clang/lib/Format/Format.cpp                   | 13 ++++-
+ clang/lib/Format/UnwrappedLineParser.cpp      | 10 ++--
+ clang/unittests/Format/ConfigParseTest.cpp    | 11 +++-
+ clang/unittests/Format/FormatTest.cpp         |  6 +--
+ clang/unittests/Format/FormatTestComments.cpp | 29 ++++++++++-
+ 11 files changed, 142 insertions(+), 46 deletions(-)
+
+diff --git a/clang/docs/ClangFormatStyleOptions.rst b/clang/docs/ClangFormatStyleOptions.rst
+index 6c2e6da59484..df98916b4647 100644
+--- a/clang/docs/ClangFormatStyleOptions.rst
++++ b/clang/docs/ClangFormatStyleOptions.rst
+@@ -5232,22 +5232,46 @@ the configuration (without a prefix: ``Auto``).
+ 
+ .. _ReflowComments:
+ 
+-**ReflowComments** (``Boolean``) :versionbadge:`clang-format 3.8` :ref:`¶ <ReflowComments>`
+-  If ``true``, clang-format will attempt to re-flow comments. That is it
+-  will touch a comment and *reflow* long comments into new lines, trying to
+-  obey the ``ColumnLimit``.
++**ReflowComments** (``ReflowCommentsStyle``) :versionbadge:`clang-format 3.8` :ref:`¶ <ReflowComments>`
++  Comment reformatting style.
+ 
+-  .. code-block:: c++
++  Possible values:
++
++  * ``RCS_Never`` (in configuration: ``Never``)
++    Leave comments untouched.
++
++    .. code-block:: c++
++
++       // veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information
++       /* second veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information */
++       /* third veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information
++            * and a misaligned second line */
++
++  * ``RCS_IndentOnly`` (in configuration: ``IndentOnly``)
++    Only apply indentation rules, moving comments left or right, without
++    changing formatting inside the comments.
++
++    .. code-block:: c++
++
++       // veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information
++       /* second veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information */
++       /* third veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information
++        * and a misaligned second line */
++
++  * ``RCS_Always`` (in configuration: ``Always``)
++    Apply indentation rules and reflow long comments into new lines, trying
++    to obey the ``ColumnLimit``.
++
++    .. code-block:: c++
++
++       // veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of
++       // information
++       /* second veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of
++        * information */
++       /* third veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of
++        * information and a misaligned second line */
+ 
+-     false:
+-     // veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information
+-     /* second veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information */
+ 
+-     true:
+-     // veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of
+-     // information
+-     /* second veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of
+-      * information */
+ 
+ .. _RemoveBracesLLVM:
+ 
+diff --git a/clang/docs/ReleaseNotes.rst b/clang/docs/ReleaseNotes.rst
+index 8c7a6ba70acd..24cbb46da699 100644
+--- a/clang/docs/ReleaseNotes.rst
++++ b/clang/docs/ReleaseNotes.rst
+@@ -1376,6 +1376,8 @@ clang-format
+ - Add ``ExceptDoubleParentheses`` sub-option for ``SpacesInParensOptions``
+   to override addition of spaces between multiple, non-redundant parentheses
+   similar to the rules used for ``RemoveParentheses``.
++- Adds ``IndentOnly`` suboption to ``ReflowComments`` to fix the indentation of multi-line comments
++  without touching their contents, renames ``false`` to ``Never``, and ``true`` to ``Always``.
+ 
+ libclang
+ --------
+diff --git a/clang/include/clang/Format/Format.h b/clang/include/clang/Format/Format.h
+index c454ab2bc0ce..c8d615a0bf15 100644
+--- a/clang/include/clang/Format/Format.h
++++ b/clang/include/clang/Format/Format.h
+@@ -3779,24 +3779,43 @@ struct FormatStyle {
+   ReferenceAlignmentStyle ReferenceAlignment;
+ 
+   // clang-format off
+-  /// If ``true``, clang-format will attempt to re-flow comments. That is it
+-  /// will touch a comment and *reflow* long comments into new lines, trying to
+-  /// obey the ``ColumnLimit``.
+-  /// \code
+-  ///    false:
+-  ///    // veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information
+-  ///    /* second veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information */
+-  ///
+-  ///    true:
+-  ///    // veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of
+-  ///    // information
+-  ///    /* second veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of
+-  ///     * information */
+-  /// \endcode
+-  /// \version 3.8
+-  bool ReflowComments;
++  /// \brief Types of comment reflow style.
++  enum ReflowCommentsStyle : int8_t {
++    /// Leave comments untouched.
++    /// \code
++    ///    // veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information
++    ///    /* second veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information */
++    ///    /* third veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information
++    ///         * and a misaligned second line */
++    /// \endcode
++    RCS_Never,
++    /// Only apply indentation rules, moving comments left or right, without
++    /// changing formatting inside the comments.
++    /// \code
++    ///    // veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information
++    ///    /* second veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information */
++    ///    /* third veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of information
++    ///     * and a misaligned second line */
++    /// \endcode
++    RCS_IndentOnly,
++    /// Apply indentation rules and reflow long comments into new lines, trying
++    /// to obey the ``ColumnLimit``.
++    /// \code
++    ///    // veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of
++    ///    // information
++    ///    /* second veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of
++    ///     * information */
++    ///    /* third veryVeryVeryVeryVeryVeryVeryVeryVeryVeryVeryLongComment with plenty of
++    ///     * information and a misaligned second line */
++    /// \endcode
++    RCS_Always
++  };
+   // clang-format on
+ 
++  /// \brief Comment reformatting style.
++  /// \version 3.8
++  ReflowCommentsStyle ReflowComments;
++
+   /// Remove optional braces of control statements (``if``, ``else``, ``for``,
+   /// and ``while``) in C++ according to the LLVM coding style.
+   /// \warning
+diff --git a/clang/lib/Format/BreakableToken.cpp b/clang/lib/Format/BreakableToken.cpp
+index 75304908dc65..bde775787699 100644
+--- a/clang/lib/Format/BreakableToken.cpp
++++ b/clang/lib/Format/BreakableToken.cpp
+@@ -420,7 +420,7 @@ BreakableComment::getSplit(unsigned LineIndex, unsigned TailOffset,
+                            unsigned ColumnLimit, unsigned ContentStartColumn,
+                            const llvm::Regex &CommentPragmasRegex) const {
+   // Don't break lines matching the comment pragmas regex.
+-  if (CommentPragmasRegex.match(Content[LineIndex]))
++  if (!AlwaysReflow || CommentPragmasRegex.match(Content[LineIndex]))
+     return Split(StringRef::npos, 0);
+   return getCommentSplit(Content[LineIndex].substr(TailOffset),
+                          ContentStartColumn, ColumnLimit, Style.TabWidth,
+@@ -608,7 +608,7 @@ BreakableToken::Split BreakableBlockComment::getSplit(
+     unsigned LineIndex, unsigned TailOffset, unsigned ColumnLimit,
+     unsigned ContentStartColumn, const llvm::Regex &CommentPragmasRegex) const {
+   // Don't break lines matching the comment pragmas regex.
+-  if (CommentPragmasRegex.match(Content[LineIndex]))
++  if (!AlwaysReflow || CommentPragmasRegex.match(Content[LineIndex]))
+     return Split(StringRef::npos, 0);
+   return getCommentSplit(Content[LineIndex].substr(TailOffset),
+                          ContentStartColumn, ColumnLimit, Style.TabWidth,
+@@ -855,7 +855,8 @@ bool BreakableBlockComment::mayReflow(
+   StringRef IndentContent = Content[LineIndex];
+   if (Lines[LineIndex].ltrim(Blanks).starts_with("*"))
+     IndentContent = Lines[LineIndex].ltrim(Blanks).substr(1);
+-  return LineIndex > 0 && !CommentPragmasRegex.match(IndentContent) &&
++  return LineIndex > 0 && AlwaysReflow &&
++         !CommentPragmasRegex.match(IndentContent) &&
+          mayReflowContent(Content[LineIndex]) && !Tok.Finalized &&
+          !switchesFormatting(tokenAt(LineIndex));
+ }
+@@ -1160,7 +1161,8 @@ bool BreakableLineCommentSection::mayReflow(
+   // // text that protrudes
+   // //    into text with different indent
+   // We do reflow in that case in block comments.
+-  return LineIndex > 0 && !CommentPragmasRegex.match(IndentContent) &&
++  return LineIndex > 0 && AlwaysReflow &&
++         !CommentPragmasRegex.match(IndentContent) &&
+          mayReflowContent(Content[LineIndex]) && !Tok.Finalized &&
+          !switchesFormatting(tokenAt(LineIndex)) &&
+          OriginalPrefix[LineIndex] == OriginalPrefix[LineIndex - 1];
+diff --git a/clang/lib/Format/BreakableToken.h b/clang/lib/Format/BreakableToken.h
+index 8b9360a3335e..45c00b35fd01 100644
+--- a/clang/lib/Format/BreakableToken.h
++++ b/clang/lib/Format/BreakableToken.h
+@@ -384,6 +384,8 @@ protected:
+   // The intended start column of the first line of text from this section.
+   unsigned StartColumn;
+ 
++  const bool AlwaysReflow = Style.ReflowComments == FormatStyle::RCS_Always;
++
+   // The prefix to use in front a line that has been reflown up.
+   // For example, when reflowing the second line after the first here:
+   // // comment 1
+diff --git a/clang/lib/Format/ContinuationIndenter.cpp b/clang/lib/Format/ContinuationIndenter.cpp
+index 7d89f0e63dd2..96f77e7cc277 100644
+--- a/clang/lib/Format/ContinuationIndenter.cpp
++++ b/clang/lib/Format/ContinuationIndenter.cpp
+@@ -2398,7 +2398,7 @@ ContinuationIndenter::createBreakableToken(const FormatToken &Current,
+           State.Line->InPPDirective, Encoding, Style);
+     }
+   } else if (Current.is(TT_BlockComment)) {
+-    if (!Style.ReflowComments ||
++    if (Style.ReflowComments == FormatStyle::RCS_Never ||
+         // If a comment token switches formatting, like
+         // /* clang-format on */, we don't want to break it further,
+         // but we may still want to adjust its indentation.
+@@ -2419,7 +2419,7 @@ ContinuationIndenter::createBreakableToken(const FormatToken &Current,
+       }
+       return true;
+     }();
+-    if (!Style.ReflowComments ||
++    if (Style.ReflowComments == FormatStyle::RCS_Never ||
+         CommentPragmasRegex.match(Current.TokenText.substr(2)) ||
+         switchesFormatting(Current) || !RegularComments) {
+       return nullptr;
+diff --git a/clang/lib/Format/Format.cpp b/clang/lib/Format/Format.cpp
+index 7fd42e46e0cc..3f3e33c7b117 100644
+--- a/clang/lib/Format/Format.cpp
++++ b/clang/lib/Format/Format.cpp
+@@ -505,6 +505,17 @@ template <> struct MappingTraits<FormatStyle::RawStringFormat> {
+   }
+ };
+ 
++template <> struct ScalarEnumerationTraits<FormatStyle::ReflowCommentsStyle> {
++  static void enumeration(IO &IO, FormatStyle::ReflowCommentsStyle &Value) {
++    IO.enumCase(Value, "Never", FormatStyle::RCS_Never);
++    IO.enumCase(Value, "IndentOnly", FormatStyle::RCS_IndentOnly);
++    IO.enumCase(Value, "Always", FormatStyle::RCS_Always);
++    // For backward compatibility:
++    IO.enumCase(Value, "false", FormatStyle::RCS_Never);
++    IO.enumCase(Value, "true", FormatStyle::RCS_Always);
++  }
++};
++
+ template <>
+ struct ScalarEnumerationTraits<FormatStyle::ReferenceAlignmentStyle> {
+   static void enumeration(IO &IO, FormatStyle::ReferenceAlignmentStyle &Value) {
+@@ -1547,7 +1558,7 @@ FormatStyle getLLVMStyle(FormatStyle::LanguageKind Language) {
+   LLVMStyle.PPIndentWidth = -1;
+   LLVMStyle.QualifierAlignment = FormatStyle::QAS_Leave;
+   LLVMStyle.ReferenceAlignment = FormatStyle::RAS_Pointer;
+-  LLVMStyle.ReflowComments = true;
++  LLVMStyle.ReflowComments = FormatStyle::RCS_Always;
+   LLVMStyle.RemoveBracesLLVM = false;
+   LLVMStyle.RemoveParentheses = FormatStyle::RPS_Leave;
+   LLVMStyle.RemoveSemicolon = false;
+diff --git a/clang/lib/Format/UnwrappedLineParser.cpp b/clang/lib/Format/UnwrappedLineParser.cpp
+index bfb592ae0749..0a5cdc56f2a3 100644
+--- a/clang/lib/Format/UnwrappedLineParser.cpp
++++ b/clang/lib/Format/UnwrappedLineParser.cpp
+@@ -4618,9 +4618,9 @@ bool UnwrappedLineParser::isOnNewLine(const FormatToken &FormatTok) {
+ // section on \p Line.
+ static bool
+ continuesLineCommentSection(const FormatToken &FormatTok,
+-                            const UnwrappedLine &Line,
++                            const UnwrappedLine &Line, const FormatStyle &Style,
+                             const llvm::Regex &CommentPragmasRegex) {
+-  if (Line.Tokens.empty())
++  if (Line.Tokens.empty() || Style.ReflowComments != FormatStyle::RCS_Always)
+     return false;
+ 
+   StringRef IndentContent = FormatTok.TokenText;
+@@ -4733,7 +4733,7 @@ void UnwrappedLineParser::flushComments(bool NewlineBeforeNext) {
+     // FIXME: Consider putting separate line comment sections as children to the
+     // unwrapped line instead.
+     Tok->ContinuesLineCommentSection =
+-        continuesLineCommentSection(*Tok, *Line, CommentPragmasRegex);
++        continuesLineCommentSection(*Tok, *Line, Style, CommentPragmasRegex);
+     if (isOnNewLine(*Tok) && JustComments && !Tok->ContinuesLineCommentSection)
+       addUnwrappedLine();
+     pushToken(Tok);
+@@ -4806,8 +4806,8 @@ void UnwrappedLineParser::distributeComments(
+     if (HasTrailAlignedWithNextToken && i == StartOfTrailAlignedWithNextToken) {
+       FormatTok->ContinuesLineCommentSection = false;
+     } else {
+-      FormatTok->ContinuesLineCommentSection =
+-          continuesLineCommentSection(*FormatTok, *Line, CommentPragmasRegex);
++      FormatTok->ContinuesLineCommentSection = continuesLineCommentSection(
++          *FormatTok, *Line, Style, CommentPragmasRegex);
+     }
+     if (!FormatTok->ContinuesLineCommentSection &&
+         (isOnNewLine(*FormatTok) || FormatTok->IsFirst)) {
+diff --git a/clang/unittests/Format/ConfigParseTest.cpp b/clang/unittests/Format/ConfigParseTest.cpp
+index cc044153b7c9..058912adc6f7 100644
+--- a/clang/unittests/Format/ConfigParseTest.cpp
++++ b/clang/unittests/Format/ConfigParseTest.cpp
+@@ -184,7 +184,6 @@ TEST(ConfigParseTest, ParsesConfigurationBools) {
+   CHECK_PARSE_BOOL(ObjCSpaceAfterProperty);
+   CHECK_PARSE_BOOL(ObjCSpaceBeforeProtocolList);
+   CHECK_PARSE_BOOL(Cpp11BracedListStyle);
+-  CHECK_PARSE_BOOL(ReflowComments);
+   CHECK_PARSE_BOOL(RemoveBracesLLVM);
+   CHECK_PARSE_BOOL(RemoveSemicolon);
+   CHECK_PARSE_BOOL(SkipMacroDefinitionBody);
+@@ -377,6 +376,16 @@ TEST(ConfigParseTest, ParsesConfiguration) {
+   CHECK_PARSE("PointerBindsToType: Middle", PointerAlignment,
+               FormatStyle::PAS_Middle);
+ 
++  Style.ReflowComments = FormatStyle::RCS_Always;
++  CHECK_PARSE("ReflowComments: Never", ReflowComments, FormatStyle::RCS_Never);
++  CHECK_PARSE("ReflowComments: IndentOnly", ReflowComments,
++              FormatStyle::RCS_IndentOnly);
++  CHECK_PARSE("ReflowComments: Always", ReflowComments,
++              FormatStyle::RCS_Always);
++  // For backward compatibility:
++  CHECK_PARSE("ReflowComments: false", ReflowComments, FormatStyle::RCS_Never);
++  CHECK_PARSE("ReflowComments: true", ReflowComments, FormatStyle::RCS_Always);
++
+   Style.Standard = FormatStyle::LS_Auto;
+   CHECK_PARSE("Standard: c++03", Standard, FormatStyle::LS_Cpp03);
+   CHECK_PARSE("Standard: c++11", Standard, FormatStyle::LS_Cpp11);
+diff --git a/clang/unittests/Format/FormatTest.cpp b/clang/unittests/Format/FormatTest.cpp
+index b7d8fc8ea72c..fe5c18dd05c5 100644
+--- a/clang/unittests/Format/FormatTest.cpp
++++ b/clang/unittests/Format/FormatTest.cpp
+@@ -17966,7 +17966,7 @@ TEST_F(FormatTest, AlignConsecutiveMacros) {
+ 
+   // Test across comments
+   Style.MaxEmptyLinesToKeep = 10;
+-  Style.ReflowComments = false;
++  Style.ReflowComments = FormatStyle::RCS_Never;
+   Style.AlignConsecutiveMacros.AcrossComments = true;
+   verifyFormat("#define a    3\n"
+                "// line comment\n"
+@@ -18713,7 +18713,7 @@ TEST_F(FormatTest, AlignConsecutiveAssignmentsAcrossEmptyLinesAndComments) {
+                "y = 1;",
+                Alignment);
+ 
+-  Alignment.ReflowComments = true;
++  Alignment.ReflowComments = FormatStyle::RCS_Always;
+   Alignment.ColumnLimit = 50;
+   verifyFormat("int x   = 0;\n"
+                "int yy  = 1; /// specificlennospace\n"
+@@ -19111,7 +19111,7 @@ TEST_F(FormatTest, AlignConsecutiveAssignments) {
+                "y = 1;",
+                Alignment);
+ 
+-  EXPECT_EQ(Alignment.ReflowComments, true);
++  EXPECT_EQ(Alignment.ReflowComments, FormatStyle::RCS_Always);
+   Alignment.ColumnLimit = 50;
+   verifyFormat("int x   = 0;\n"
+                "int yy  = 1; /// specificlennospace\n"
+diff --git a/clang/unittests/Format/FormatTestComments.cpp b/clang/unittests/Format/FormatTestComments.cpp
+index 8f84d59cbb2e..1c6aea683f8c 100644
+--- a/clang/unittests/Format/FormatTestComments.cpp
++++ b/clang/unittests/Format/FormatTestComments.cpp
+@@ -493,9 +493,36 @@ TEST_F(FormatTestComments, AlignsBlockComments) {
+ 
+ TEST_F(FormatTestComments, CommentReflowingCanBeTurnedOff) {
+   FormatStyle Style = getLLVMStyleWithColumns(20);
+-  Style.ReflowComments = false;
++  Style.ReflowComments = FormatStyle::RCS_Never;
+   verifyFormat("// aaaaaaaaa aaaaaaaaaa aaaaaaaaaa", Style);
+   verifyFormat("/* aaaaaaaaa aaaaaaaaaa aaaaaaaaaa */", Style);
++  verifyNoChange("/* aaaaaaaaa aaaaaaaaaa aaaaaaaaaa\n"
++                 "aaaaaaaaa*/",
++                 Style);
++  verifyNoChange("/* aaaaaaaaa aaaaaaaaaa aaaaaaaaaa\n"
++                 "    aaaaaaaaa*/",
++                 Style);
++  verifyNoChange("/* aaaaaaaaa aaaaaaaaaa aaaaaaaaaa\n"
++                 " *    aaaaaaaaa*/",
++                 Style);
++}
++
++TEST_F(FormatTestComments, CommentReflowingCanApplyOnlyToIndents) {
++  FormatStyle Style = getLLVMStyleWithColumns(20);
++  Style.ReflowComments = FormatStyle::RCS_IndentOnly;
++  verifyFormat("// aaaaaaaaa aaaaaaaaaa aaaaaaaaaa", Style);
++  verifyFormat("/* aaaaaaaaa aaaaaaaaaa aaaaaaaaaa */", Style);
++  verifyNoChange("/* aaaaaaaaa aaaaaaaaaa aaaaaaaaaa\n"
++                 "aaaaaaaaa*/",
++                 Style);
++  verifyNoChange("/* aaaaaaaaa aaaaaaaaaa aaaaaaaaaa\n"
++                 "    aaaaaaaaa*/",
++                 Style);
++  verifyFormat("/* aaaaaaaaa aaaaaaaaaa aaaaaaaaaa\n"
++               " * aaaaaaaaa*/",
++               "/* aaaaaaaaa aaaaaaaaaa aaaaaaaaaa\n"
++               "      * aaaaaaaaa*/",
++               Style);
+ }
+ 
+ TEST_F(FormatTestComments, CorrectlyHandlesLengthOfBlockComments) {
+-- 
+2.30.2
+
